@@ -1,20 +1,27 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Task } from '../types'
+import type { Activity, BackgroundTask, Task } from '../types'
 
 // Any process reports a task by writing <DIR>/<id>.json:
 // { "label": "kernel build", "current": 812, "total": 4500, "percent": 18, "phase": "3/6 compiling",
 //   "state": "running" | "done" | "failed", "updatedAt": <epoch ms> }   every field optional.
 const DIR = '.local/state/agent-progress'
+const CLIP_DIR = '.local/state/clipboard-shots'
 const POLL_MS = 2000
+const TICK_MS = 5000
 // A running task that has not written for this long is assumed dead and hidden.
 const STALE_MS = 15 * 60e3
 // A finished task stays on screen this long.
 const DONE_SHOWN_MS = 60e3
+// A turn with no tool call starting or ending for this long reads as possibly stuck. A guess.
+const STALL_MS = 3 * 60e3
 const BAR_CELLS = 20
 
 const tasks = atom({ plugin: 'task-progress', key: 'tasks' } as const, [])
+const background = atom({ plugin: 'task-progress', key: 'background' } as const, [])
+const activity = atom({ plugin: 'task-progress', key: 'activity' } as const, { isTurnRunning: false, lastAt: 0, runningTool: null, toolStartedAt: null })
+const tick = atom({ plugin: 'task-progress', key: 'tick' } as const, 0)
 
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null)
@@ -60,22 +67,101 @@ async function poll($: any) {
   found.sort((a, b) => a.id.localeCompare(b.id))
   const before = await read($, tasks)
   if (JSON.stringify(before) !== JSON.stringify(found)) await update($, tasks, () => found)
+  const done = (await read($, background)).filter(t => t.endedAt === null || now - t.endedAt < DONE_SHOWN_MS)
+  if (done.length !== (await read($, background)).length) await update($, background, () => done)
+}
+
+// Redraws elapsed times while something time-based is on screen.
+async function advance($: any) {
+  const busy = (await read($, background)).some(t => t.endedAt === null) || (await read($, activity)).isTurnRunning
+  if (busy) await update($, tick, n => n + 1)
+}
+
+async function touch($: any, tool: string | null) {
+  const now = await $.clock.now()
+  await update($, activity, a => ({ ...a, lastAt: now, runningTool: tool, toolStartedAt: tool ? now : null }))
+}
+
+async function saveClipboard($: any) {
+  const home = await $.env.get('HOME')
+  const now = await $.clock.now()
+  const path = `${home}/${CLIP_DIR}/clip-${now}.png`
+  await $.fs.write(`${home}/${CLIP_DIR}/.keep`, '')
+  const script = [
+    `set f to open for access POSIX file "${path}" with write permission`,
+    'write (the clipboard as «class PNGf») to f',
+    'close access f',
+  ]
+  const run = $.process.spawn({ argv: ['/usr/bin/osascript', ...script.flatMap(line => ['-e', line])] })
+  for await (const _ of run) { /* drain */ }
+  const { code } = await run.result
+  return code === 0 ? path : null
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    await $.command.register({ name: 'clip', description: 'Attach the image on the clipboard (a screenshot) to the conversation' })
     await poll($)
     $.clock.every(POLL_MS, () => { void poll($) })
+    $.clock.every(TICK_MS, () => { void advance($) })
     return started
+  })
+
+  on('command.run', { command: 'clip' }, async $ => {
+    const path = await saveClipboard($)
+    return path
+      ? { text: `Screenshot from the clipboard saved to ${path}. Read it with the Read tool before answering.` }
+      : { text: 'The clipboard holds no image.' }
+  })
+
+  on('prompt.submit', async ($, e, next) => {
+    const now = await $.clock.now()
+    await update($, activity, () => ({ isTurnRunning: true, lastAt: now, runningTool: null, toolStartedAt: null }))
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    await update($, activity, a => ({ ...a, isTurnRunning: false, runningTool: null, toolStartedAt: null }))
+    return next(e)
+  })
+
+  on('tool.call', async ($, e, next) => {
+    await touch($, e.tool)
+    const ran = await next(e)
+    await touch($, null)
+    const id = e.tool === 'Bash' ? (ran.result as any)?.backgroundTaskId : undefined
+    if (typeof id === 'string') {
+      const now = await $.clock.now()
+      const label = str((e as any).description) ?? String((e as any).command ?? 'background command').slice(0, 60)
+      await update($, background, list => [...list.filter(t => t.id !== id), { id, label, startedAt: now, endedAt: null, status: null }])
+    }
+    return ran
+  })
+
+  on('ui.render', { component: 'UserMessage', props: { origin: { kind: 'task-notification' } } }, async ($, e, next) => {
+    const task = e.props.task
+    if (task?.id) {
+      const list = await read($, background)
+      if (list.some(t => t.id === task.id && t.endedAt === null)) {
+        const now = await $.clock.now()
+        await update($, background, all => all.map(t => (t.id === task.id ? { ...t, endedAt: now, status: task.status ?? 'ended' } : t)))
+      }
+    }
+    return next(e)
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const shown = await read($, tasks)
+    const bg = await read($, background)
+    const act = await read($, activity)
+    await read($, tick)
     const below = await next(e)
-    if (e.props.hasSurvey || shown.length === 0) return below
-    const { Box, Text } = $.ui.resolve(e)
     const now = await $.clock.now()
+    const stalled = act.isTurnRunning && act.runningTool === null && act.lastAt > 0 && now - act.lastAt > STALL_MS
+    const longTool = act.isTurnRunning && act.runningTool !== null && act.toolStartedAt !== null && now - act.toolStartedAt > STALL_MS
+    if (e.props.hasSurvey || (shown.length === 0 && bg.length === 0 && !stalled && !longTool)) return below
+    const { Box, Text } = $.ui.resolve(e)
 
     return (
       <Box flexDirection="column">
@@ -84,7 +170,7 @@ export const register: Register = on => {
           const filled = Math.round(share * BAR_CELLS)
           const color = t.state === 'failed' ? 'red' : t.state === 'done' ? 'green' : undefined
           const count = t.current !== null ? (t.total !== null ? `${t.current}/${t.total}` : `${t.current}`) : null
-          const quiet = now - t.updatedAt > 60e3 ? `quiet ${duration(now - t.updatedAt)}` : null
+          const quiet = now - t.updatedAt > 60e3 && t.state === 'running' ? `quiet ${duration(now - t.updatedAt)}` : null
           return (
             <Box key={t.id} flexDirection="row" columnGap={1}>
               <Text>{t.label}</Text>
@@ -97,6 +183,19 @@ export const register: Register = on => {
             </Box>
           )
         })}
+        {bg.map(t => {
+          const failed = t.status !== null && t.status !== 'completed'
+          const color = t.endedAt === null ? undefined : failed ? 'red' : 'green'
+          return (
+            <Box key={`bg-${t.id}`} flexDirection="row" columnGap={1}>
+              <Text dimColor>bg</Text>
+              <Text>{t.label}</Text>
+              <Text color={color}>{t.endedAt === null ? `running ${duration(now - t.startedAt)}` : `${t.status} after ${duration(t.endedAt - t.startedAt)}`}</Text>
+            </Box>
+          )
+        })}
+        {stalled ? <Text color="yellow">no tool activity for {duration(now - act.lastAt)}, the agent may be stuck</Text> : null}
+        {longTool ? <Text color="yellow">{act.runningTool} running for {duration(now - act.toolStartedAt!)}</Text> : null}
         {below}
       </Box>
     )

@@ -10,8 +10,23 @@ export type Task = {
   etaMs: number | null
 }
 
+export type BackgroundTask = {
+  id: string
+  label: string
+  startedAt: number
+  endedAt: number | null
+  status: string | null
+}
+
+export type Activity = {
+  isTurnRunning: boolean
+  lastAt: number
+  runningTool: string | null
+  toolStartedAt: number | null
+}
+
 declare module 'claude-code' {
   interface PluginState {
-    'task-progress': { tasks: Task[] }
+    'task-progress': { tasks: Task[]; background: BackgroundTask[]; activity: Activity; tick: number }
   }
 }
