@@ -1,0 +1,32 @@
+#!/bin/bash
+# Report a task's progress to ~/.local/state/agent-progress/<id>.json, which the task-progress mod draws above the Claude prompt.
+#   progress <id> <current> <total> [label] [phase]
+#   progress <id> pct <percent> [label] [phase]
+#   progress <id> done|fail [label]
+#   progress <id> clear
+set -euo pipefail
+dir="${XDG_STATE_HOME:-$HOME/.local/state}/agent-progress"
+mkdir -p "$dir"
+[ $# -ge 2 ] || { sed -n '3,6p' "$0" | sed 's/^# *//'; exit 2; }
+id="$1"; shift
+file="$dir/$id.json"
+json() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+now=$(python3 -c 'import time; print(int(time.time()*1000))')
+case "$1" in
+  clear) rm -f "$file"; exit 0 ;;
+  done|fail)
+    state=$([ "$1" = done ] && echo done || echo failed)
+    body="\"state\":\"$state\""
+    [ $# -ge 2 ] && body="$body,\"label\":$(json "$2")" ;;
+  pct)
+    body="\"state\":\"running\",\"percent\":$2"
+    [ $# -ge 3 ] && body="$body,\"label\":$(json "$3")"
+    [ $# -ge 4 ] && body="$body,\"phase\":$(json "$4")" ;;
+  *)
+    body="\"state\":\"running\",\"current\":$1,\"total\":$2"
+    [ $# -ge 3 ] && body="$body,\"label\":$(json "$3")"
+    [ $# -ge 4 ] && body="$body,\"phase\":$(json "$4")" ;;
+esac
+tmp=$(mktemp "$dir/.$id.XXXXXX")
+printf '{%s,"updatedAt":%s}\n' "$body" "$now" > "$tmp"
+mv -f "$tmp" "$file"
