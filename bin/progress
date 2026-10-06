@@ -1,5 +1,6 @@
 #!/bin/bash
-# Report a task's progress to ~/.local/state/agent-progress/<id>.json, which the task-progress mod draws above the Claude prompt.
+# Report a task's progress to ~/.local/state/agent-progress/<id>.json, which the task-progress mod draws above the Claude prompt
+# of the profile that wrote it (all profiles when run outside Claude).
 #   progress <id> <current> <total> [label] [phase]
 #   progress <id> pct <percent> [label] [phase]
 #   progress <id> done|fail [label]
@@ -28,5 +29,7 @@ case "$1" in
     [ $# -ge 4 ] && body="$body,\"phase\":$(json "$4")" ;;
 esac
 tmp=$(mktemp "$dir/.$id.XXXXXX")
+# Stamp the Claude account that wrote it, so the band shows it only in that account's profile.
+[ -n "${CLAUDE_CODE_ACCOUNT_UUID:-}" ] && body="$body,\"account\":$(json "$CLAUDE_CODE_ACCOUNT_UUID")"
 printf '{%s,"updatedAt":%s}\n' "$body" "$now" > "$tmp"
 mv -f "$tmp" "$file"

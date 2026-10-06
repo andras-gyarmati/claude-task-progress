@@ -17,6 +17,8 @@ const DONE_SHOWN_MS = 60e3
 // A turn with no tool call starting or ending for this long reads as possibly stuck. A guess.
 const STALL_MS = 3 * 60e3
 const BAR_CELLS = 20
+// Wider than any terminal; the divider row clips it to the band's width.
+const DIVIDER = '─'.repeat(400)
 
 const tasks = atom({ plugin: 'task-progress', key: 'tasks' } as const, [])
 const background = atom({ plugin: 'task-progress', key: 'background' } as const, [])
@@ -41,6 +43,8 @@ async function poll($: any) {
   const dir = `${home}/${DIR}`
   const entries = await $.fs.list(dir).catch(() => [])
   const now = await $.clock.now()
+  // Profiles share HOME, so every profile sees every file; show only this account's tasks and unstamped ones.
+  const account = await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')
   const found: Task[] = []
   for (const entry of entries) {
     if (entry.kind !== 'file' || !entry.name.endsWith('.json')) continue
@@ -49,6 +53,7 @@ async function poll($: any) {
     if (raw === null) continue
     let data: Record<string, unknown>
     try { data = JSON.parse(raw as string) } catch { continue }
+    if (account && str(data.account) && data.account !== account) continue
     const current = num(data.current)
     const total = num(data.total)
     const percent = num(data.percent) ?? (current !== null && total ? (current / total) * 100 : null)
@@ -196,6 +201,7 @@ export const register: Register = on => {
         })}
         {stalled ? <Text color="yellow">no tool activity for {duration(now - act.lastAt)}, the agent may be stuck</Text> : null}
         {longTool ? <Text color="yellow">{act.runningTool} running for {duration(now - act.toolStartedAt!)}</Text> : null}
+        {below ? <Box height={1} overflow="hidden"><Text dimColor>{DIVIDER}</Text></Box> : null}
         {below}
       </Box>
     )

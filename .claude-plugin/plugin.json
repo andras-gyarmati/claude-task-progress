@@ -1,6 +1,6 @@
 {
   "name": "task-progress",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Progress bars above the prompt for any long task that writes ~/.local/state/agent-progress/<id>.json",
   "author": {
     "name": "Andras Gyarmati",
